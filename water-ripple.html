@@ -166,7 +166,7 @@ var SIM_FS = [
 '}'
 ].join('\n');
 
-// Render: refraction + lens + dispersion + Fresnel + depth + specular
+// Render: refraction + lens + dispersion + Fresnel + depth + caustics + ridge + specular
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
@@ -180,13 +180,13 @@ var RENDER_FS = [
 '',
 'void main(){',
 // Mode-dependent parameters (branch-free)
-'  float rStr=mix(0.04,0.07,uMode);',
-'  float lStr=mix(0.8,1.6,uMode);',
-'  float disp=mix(0.018,0.045,uMode);',
-'  float fBase=mix(0.02,0.05,uMode);',
-'  float dStr=mix(0.35,0.7,uMode);',
-'  float spS=mix(220.0,450.0,uMode);',
-'  float spB=mix(14.0,28.0,uMode);',
+'  float rStr=mix(0.12,0.16,uMode);',
+'  float lStr=mix(2.0,3.5,uMode);',
+'  float disp=mix(0.03,0.065,uMode);',
+'  float fBase=mix(0.03,0.06,uMode);',
+'  float dStr=mix(0.6,1.1,uMode);',
+'  float spS=mix(180.0,400.0,uMode);',
+'  float spB=mix(18.0,35.0,uMode);',
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -194,8 +194,11 @@ var RENDER_FS = [
 '  float hR=texture2D(uH,vUv+vec2( t.x,0)).r;',
 '  float hT=texture2D(uH,vUv+vec2(0, t.y)).r;',
 '  float hB=texture2D(uH,vUv+vec2(0,-t.y)).r;',
-'  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',       // NOT normalized
+'  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',
 '  float lap=hL+hR+hT+hB-4.0*h;',
+'',
+// Height gradient magnitude (for ridge detection)
+'  float gMag=length(grad);',
 '',
 // Refraction + lens
 '  vec2 rOff=grad*rStr;',
@@ -209,7 +212,7 @@ var RENDER_FS = [
 '',
 // Camera UV with cover-fit + mirror
 '  vec2 cUv=vUv;',
-'  float nCX=step(uAspect,uCamAsp);',         // need crop X?
+'  float nCX=step(uAspect,uCamAsp);',
 '  float crX=nCX*(1.0-uAspect/uCamAsp)*0.5;',
 '  float crY=(1.0-nCX)*(1.0-uCamAsp/uAspect)*0.5;',
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
@@ -230,20 +233,38 @@ var RENDER_FS = [
 '',
 // Wave depth shading: warm peaks, cool troughs
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
-'  vec3 warm=vec3(1.06,0.97,0.87);',
-'  vec3 cool=vec3(0.87,0.95,1.08);',
+'  vec3 warm=vec3(1.08,0.98,0.88);',
+'  vec3 cool=vec3(0.85,0.94,1.10);',
 '  col*=mix(cool,warm,df);',
 '',
-// Dual-lobe specular
-'  vec3 L=normalize(vec3(0.3,0.5,1.0));',
-'  vec3 H=normalize(L+V);',
-'  float sS=pow(max(dot(N,H),0.0),spS);',
-'  float sB=pow(max(dot(N,H),0.0),spB);',
-'  col+=vec3(1.0,0.97,0.92)*(sS*1.2+sB*0.18)*fres;',
+// ── Ridge / crest lines ── bright lines at wave peaks
+'  float ridge=smoothstep(0.02,0.0,abs(h)-gMag*0.4);',
+'  ridge*=smoothstep(0.0,0.08,gMag);',
+'  col+=vec3(0.9,0.95,1.0)*ridge*0.7;',
 '',
-// Fresnel reflection overlay
+// ── Caustics ── light focused by wave curvature
+'  float caust=pow(max(1.0-abs(lap)*0.35,0.0),6.0);',
+'  caust*=smoothstep(0.0,0.1,gMag);',
+'  col+=vec3(1.0,0.96,0.88)*caust*0.5;',
+'',
+// Dual-lobe specular — two light sources for richer highlights
+'  vec3 L1=normalize(vec3(0.3,0.5,1.0));',
+'  vec3 L2=normalize(vec3(-0.4,0.3,1.0));',
+'  vec3 H1=normalize(L1+V);',
+'  vec3 H2=normalize(L2+V);',
+'  float sS1=pow(max(dot(N,H1),0.0),spS);',
+'  float sS2=pow(max(dot(N,H2),0.0),spS);',
+'  float sB1=pow(max(dot(N,H1),0.0),spB);',
+'  float sB2=pow(max(dot(N,H2),0.0),spB);',
+'  col+=vec3(1.0,0.97,0.92)*((sS1+sS2*0.6)*1.5+(sB1+sB2*0.4)*0.2)*fres;',
+'',
+// Fresnel reflection overlay — stronger for liquid glass look
 '  vec3 rCol=mix(vec3(0.72,0.84,1.0),vec3(0.65,0.80,1.0),uMode);',
-'  col=mix(col,rCol,fres*0.45);',
+'  col=mix(col,rCol,fres*0.55);',
+'',
+// ── Overall activity glow ── disturbed areas slightly brighter
+'  float activity=smoothstep(0.0,0.15,gMag);',
+'  col+=vec3(0.08,0.10,0.14)*activity;',
 '',
 '  gl_FragColor=vec4(col,1.0);',
 '}'
