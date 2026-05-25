@@ -148,45 +148,42 @@ var SIM_FS = [
 '    vec2 bA=vec2(uFP[i].x*uAspect,uFP[i].y);',
 '    float d=capSDF(pA,aA,bA);',
 '    float r=uDR*uAspect;',
-// Smooth falloff with broader influence area
-'    float core=smoothstep(r,0.0,d);',
-'    float halo=smoothstep(r*3.0,r*0.5,d)*0.35;',
-'    drop+=(core+halo)*uDS*a;',
+'    drop+=uDS*smoothstep(r,0.0,d)*a;',
 '  }',
 '',
-// Non-linear damping — slower decay for more visible ripples
+// Non-linear damping
 '  float amp=abs(h);',
 '  float damp=mix(uDampLo,uDampHi,smoothstep(0.0,uDampTh,amp));',
 '  v = v*damp + uSpeed*lap + drop;',
 '  h += v;',
 // Soft clamp to prevent runaway
-'  h *= 1.0 - smoothstep(2.0,3.5,abs(h))*0.12;',
+'  h *= 1.0 - smoothstep(1.5,2.5,abs(h))*0.15;',
 '',
 '  gl_FragColor=vec4(h,v,0.0,1.0);',
 '}'
 ].join('\n');
 
-// Render: neon pink liquid glass — refraction + blur + pink tint + ridge glow + fingertip light
+// Render: refraction + lens + dispersion + Fresnel + depth + specular
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
-'uniform sampler2D uH;',
-'uniform sampler2D uCam;',
+'uniform sampler2D uH;',      // height field
+'uniform sampler2D uCam;',    // camera texture
 'uniform vec2 uTexel;',
 'uniform float uAspect;',
 'uniform float uMirror;',
 'uniform float uMode;',
 'uniform float uCamAsp;',
-'uniform float uFCnt;',
-'uniform vec2 uFP[10];',
 '',
 'void main(){',
-'  float rStr=mix(0.07,0.10,uMode);',
-'  float lStr=mix(1.4,2.8,uMode);',
-'  float disp=mix(0.025,0.055,uMode);',
-'  float fBase=mix(0.04,0.07,uMode);',
-'  float dStr=mix(0.5,1.0,uMode);',
-'  float blurR=mix(2.5,4.0,uMode);',
+// Mode-dependent parameters (branch-free)
+'  float rStr=mix(0.04,0.07,uMode);',
+'  float lStr=mix(0.8,1.6,uMode);',
+'  float disp=mix(0.018,0.045,uMode);',
+'  float fBase=mix(0.02,0.05,uMode);',
+'  float dStr=mix(0.35,0.7,uMode);',
+'  float spS=mix(220.0,450.0,uMode);',
+'  float spB=mix(14.0,28.0,uMode);',
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -194,80 +191,56 @@ var RENDER_FS = [
 '  float hR=texture2D(uH,vUv+vec2( t.x,0)).r;',
 '  float hT=texture2D(uH,vUv+vec2(0, t.y)).r;',
 '  float hB=texture2D(uH,vUv+vec2(0,-t.y)).r;',
-'  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',
+'  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',       // NOT normalized
 '  float lap=hL+hR+hT+hB-4.0*h;',
-'  float gMag=length(grad);',
-'  float activity=smoothstep(0.0,0.10,gMag);',
 '',
+// Refraction + lens
 '  vec2 rOff=grad*rStr;',
 '  vec2 lOff=-grad*lap*lStr;',
 '  vec2 tot=rOff+lOff;',
+'',
+// Chromatic dispersion
 '  vec2 oR=tot*(1.0+disp);',
 '  vec2 oG=tot;',
 '  vec2 oB=tot*(1.0-disp);',
 '',
+// Camera UV with cover-fit + mirror
 '  vec2 cUv=vUv;',
-'  float nCX=step(uAspect,uCamAsp);',
+'  float nCX=step(uAspect,uCamAsp);',         // need crop X?
 '  float crX=nCX*(1.0-uAspect/uCamAsp)*0.5;',
 '  float crY=(1.0-nCX)*(1.0-uCamAsp/uAspect)*0.5;',
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
 '  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
 '',
-// 5-tap blur for liquid glass
-'  vec2 bOff=blurR*t*activity;',
-'  vec3 sC=texture2D(uCam,cUv+oG).rgb;',
-'  vec3 sL=texture2D(uCam,cUv+oG+vec2(-bOff.x,0)).rgb;',
-'  vec3 sR=texture2D(uCam,cUv+oG+vec2( bOff.x,0)).rgb;',
-'  vec3 sT=texture2D(uCam,cUv+oG+vec2(0, bOff.y)).rgb;',
-'  vec3 sBot=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
-'  vec3 col=(sC*2.0+sL+sR+sT+sBot)/6.0;',
-'  col.r=texture2D(uCam,cUv+oR+vec2(-bOff.x*0.3,0)).r*0.5+col.r*0.5;',
-'  col.b=texture2D(uCam,cUv+oB+vec2( bOff.x*0.3,0)).b*0.5+col.b*0.5;',
+'  float cr=texture2D(uCam,cUv+oR).r;',
+'  float cg=texture2D(uCam,cUv+oG).g;',
+'  float cb=texture2D(uCam,cUv+oB).b;',
+'  vec3 col=vec3(cr,cg,cb);',
 '',
+// Normal (aspect-corrected)
 '  vec3 N=normalize(vec3(-grad.x*uAspect,-grad.y,1.0));',
 '  vec3 V=vec3(0.0,0.0,1.0);',
+'',
+// Fresnel (Schlick)
 '  float NdV=max(dot(N,V),0.0);',
 '  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
 '',
-// Depth shading — pink warm / magenta cool
+// Wave depth shading: warm peaks, cool troughs
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
-'  vec3 warm=vec3(1.05,0.96,0.94);',
-'  vec3 cool=vec3(0.92,0.88,1.05);',
+'  vec3 warm=vec3(1.06,0.97,0.87);',
+'  vec3 cool=vec3(0.87,0.95,1.08);',
 '  col*=mix(cool,warm,df);',
 '',
-// ── Pink neon overlay ── translucent pink-magenta veil in disturbed areas
-'  vec3 pinkVeil=mix(vec3(0.95,0.55,0.70),vec3(0.90,0.45,0.75),uMode);',
-'  col=mix(col,pinkVeil,activity*0.25);',
-'',
-// ── Neon ridge/crest lines ── bright pink-white glow at wave peaks
-'  float ridge=smoothstep(0.02,0.0,abs(h)-gMag*0.35);',
-'  ridge*=smoothstep(0.0,0.08,gMag);',
-'  col+=vec3(1.0,0.75,0.85)*ridge*0.5;',
-'',
-// ── Fingertip glow ── bright circular light at each finger
-'  float fGlow=0.0;',
-'  for(int i=0;i<10;i++){',
-'    float fi=float(i);',
-'    float a=step(fi+0.5,uFCnt);',
-'    vec2 fp=uFP[i];',
-'    float dist=length((vUv-fp)*vec2(uAspect,1.0));',
-'    fGlow+=smoothstep(0.06,0.0,dist)*a;',
-'  }',
-'  fGlow=min(fGlow,1.0);',
-'  col+=vec3(1.0,0.70,0.82)*fGlow*0.6;',
-// Add a white core to fingertip glow
-'  col+=vec3(1.0,0.92,0.95)*smoothstep(0.55,1.0,fGlow)*0.4;',
-'',
-// Soft specular — pink-tinted
+// Dual-lobe specular
 '  vec3 L=normalize(vec3(0.3,0.5,1.0));',
-'  vec3 Hv=normalize(L+V);',
-'  float sSh=pow(max(dot(N,Hv),0.0),mix(120.0,280.0,uMode));',
-'  float sBr=pow(max(dot(N,Hv),0.0),mix(14.0,24.0,uMode));',
-'  col+=vec3(0.65,0.48,0.58)*(sSh*1.2+sBr*0.18)*fres;',
+'  vec3 H=normalize(L+V);',
+'  float sS=pow(max(dot(N,H),0.0),spS);',
+'  float sB=pow(max(dot(N,H),0.0),spB);',
+'  col+=vec3(1.0,0.97,0.92)*(sS*0.9+sB*0.13)*fres;',
 '',
-// Fresnel — pink tinted reflection
-'  vec3 rCol=mix(vec3(0.85,0.55,0.72),vec3(0.82,0.48,0.75),uMode);',
-'  col=mix(col,rCol,fres*0.45);',
+// Fresnel reflection overlay
+'  vec3 rCol=mix(vec3(0.72,0.84,1.0),vec3(0.65,0.80,1.0),uMode);',
+'  col=mix(col,rCol,fres*0.38);',
 '',
 '  gl_FragColor=vec4(col,1.0);',
 '}'
@@ -316,8 +289,7 @@ var sU = getUniforms(simProg,[
   'uFCnt','uFP[0]','uFPr[0]','uDR','uDS'
 ]);
 var rU = getUniforms(renProg,[
-  'uH','uCam','uTexel','uAspect','uMirror','uMode','uCamAsp',
-  'uFCnt','uFP[0]'
+  'uH','uCam','uTexel','uAspect','uMirror','uMode','uCamAsp'
 ]);
 
 /* ── Fullscreen quad ─────────────────── */
@@ -360,7 +332,7 @@ function initFBOs(){
   canvas.width  = Math.round(canvas.clientWidth  * dpr);
   canvas.height = Math.round(canvas.clientHeight * dpr);
   // Try decreasing maxDim until FBO is supported (mobile GPU fallback)
-  var maxDimTry=[512,384,256,128];
+  var maxDimTry=[256,192,128];
   var aspect=canvas.width/canvas.height;
   var ok=false;
   for(var m=0;m<maxDimTry.length;m++){
@@ -369,7 +341,6 @@ function initFBOs(){
     if(aspect>=1){tw=md;th=Math.round(md/aspect)}
     else{th=md;tw=Math.round(md*aspect)}
     tw=Math.max(tw,1);th=Math.max(th,1);
-    // Test with one FBO first
     var test=createFBO(tw,th);
     if(test){
       gl.deleteTexture(test.tex);
@@ -403,7 +374,7 @@ var camTex = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D,camTex);
 gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
 // placeholder 1x1
 gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
@@ -655,51 +626,42 @@ function frame(){
   // Combine hand + touch + mouse
   combineInputs();
 
+  // ── Simulation step ──
+  var readIdx  = fbi;
+  var writeIdx = 1-fbi;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[writeIdx]);
+  gl.viewport(0,0,simW,simH);
+  gl.useProgram(simProg);
+  bindQuad(simProg);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[readIdx]);
+  gl.uniform1i(sU.uState, 0);
+
+  gl.uniform2f(sU.uTexel, 1.0/simW, 1.0/simH);
+
   // Mode-interpolated sim params
   var spd  = mix(0.24, 0.28, mode);
-  var dLo  = mix(0.965, 0.980, mode);
-  var dHi  = mix(0.997, 0.999, mode);
-  var dTh  = mix(0.6, 0.4, mode);
-  var dr   = mix(0.055, 0.045, mode);
-  var ds   = mix(0.32, 0.24, mode);
+  var dLo  = mix(0.955, 0.975, mode);
+  var dHi  = mix(0.996, 0.998, mode);
+  var dTh  = mix(0.5, 0.3, mode);
+  var dr   = mix(0.03, 0.025, mode);
+  var ds   = mix(0.18, 0.14, mode);
+  gl.uniform1f(sU.uSpeed, spd);
+  gl.uniform1f(sU.uDampLo, dLo);
+  gl.uniform1f(sU.uDampHi, dHi);
+  gl.uniform1f(sU.uDampTh, dTh);
+  gl.uniform1f(sU.uAspect, canvas.width/canvas.height);
+  gl.uniform1f(sU.uFCnt, combCount);
+  gl.uniform2fv(sU['uFP[0]'],  combPos);
+  gl.uniform2fv(sU['uFPr[0]'], combPrev);
+  gl.uniform1f(sU.uDR, dr);
+  gl.uniform1f(sU.uDS, ds);
 
-  // ── Multi-step simulation ──
-  var SIM_STEPS = 3;
-  for(var step=0; step<SIM_STEPS; step++){
-    var readIdx  = fbi;
-    var writeIdx = 1-fbi;
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[writeIdx]);
-    gl.viewport(0,0,simW,simH);
-    gl.useProgram(simProg);
-    bindQuad(simProg);
-
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, tex[readIdx]);
-    gl.uniform1i(sU.uState, 0);
-
-    gl.uniform2f(sU.uTexel, 1.0/simW, 1.0/simH);
-    gl.uniform1f(sU.uSpeed, spd);
-    gl.uniform1f(sU.uDampLo, dLo);
-    gl.uniform1f(sU.uDampHi, dHi);
-    gl.uniform1f(sU.uDampTh, dTh);
-    gl.uniform1f(sU.uAspect, canvas.width/canvas.height);
-    // Only apply drops on first substep to avoid over-injection
-    if(step===0){
-      gl.uniform1f(sU.uFCnt, combCount);
-      gl.uniform2fv(sU['uFP[0]'],  combPos);
-      gl.uniform2fv(sU['uFPr[0]'], combPrev);
-      gl.uniform1f(sU.uDR, dr);
-      gl.uniform1f(sU.uDS, ds);
-    }else{
-      gl.uniform1f(sU.uFCnt, 0.0);
-      gl.uniform1f(sU.uDS, 0.0);
-    }
-
-    gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
-
-    fbi = writeIdx; // swap
-  }
+  fbi = writeIdx; // swap
 
   // ── Render ──
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -720,8 +682,6 @@ function frame(){
   gl.uniform1f(rU.uMirror, isMirrored?1.0:0.0);
   gl.uniform1f(rU.uMode, mode);
   gl.uniform1f(rU.uCamAsp, camAspect>0?camAspect:1.0);
-  gl.uniform1f(rU.uFCnt, combCount);
-  gl.uniform2fv(rU['uFP[0]'], combPos);
 
   gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
 }
