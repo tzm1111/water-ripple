@@ -75,10 +75,13 @@ var mouseX = 0, mouseY = 0, mousePrevX = 0, mousePrevY = 0;
 function showError(msg){
   errBox.style.display='block'; errBox.textContent=msg;
 }
+function dbg(msg){statusEl.textContent=msg;console.log('[dbg] '+msg)}
 
 /* ── WebGL ───────────────────────────── */
+dbg('WebGL 初始化…');
 var gl = canvas.getContext('webgl',{alpha:false,antialias:false,premultipliedAlpha:false,preserveDrawingBuffer:false});
 if(!gl){showError('WebGL 不可用');return}
+dbg('WebGL OK，检测扩展…');
 
 var floatExt    = gl.getExtension('OES_texture_float');
 var floatLinExt = gl.getExtension('OES_texture_float_linear');
@@ -279,10 +282,11 @@ function getUniforms(progr,names){
   var o={};names.forEach(function(n){o[n]=gl.getUniformLocation(progr,n)});return o;
 }
 
-/* ── Create programs ─────────────────── */
+dbg('编译 Shader…');
 var simProg = makeProgram(SIM_FS);
 var renProg = makeProgram(RENDER_FS);
-if(!simProg||!renProg) return;
+if(!simProg||!renProg){showError('Shader 编译/链接失败');return}
+dbg('Shader OK');
 
 var sU = getUniforms(simProg,[
   'uState','uTexel','uSpeed','uDampLo','uDampHi','uDampTh','uAspect',
@@ -367,7 +371,10 @@ function initFBOs(){
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
 }
+dbg('创建 FBO…');
 initFBOs();
+if(fbo.length<2){showError('FBO 创建失败');return}
+dbg('FBO OK (分辨率 '+simW+'x'+simH+')');
 
 /* ── Camera texture ──────────────────── */
 var camTex = gl.createTexture();
@@ -419,6 +426,7 @@ function startCamera(){
     cameraReady=true;
   });
 }
+dbg('启动摄像头…');
 startCamera();
 
 function switchCamera(){
@@ -688,6 +696,7 @@ function frame(){
 
 function mix(a,b,t){return a+(b-a)*t}
 
+dbg('渲染循环启动');
 requestAnimationFrame(frame);
 
 /* ── Resize ──────────────────────────── */
