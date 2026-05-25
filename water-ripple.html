@@ -166,7 +166,7 @@ var SIM_FS = [
 '}'
 ].join('\n');
 
-// Render: frosted glass — refraction + blur + dispersion + Fresnel + subsurface
+// Render: frosted liquid — strong ripples + blur + milk veil (no white blow)
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
@@ -179,13 +179,14 @@ var RENDER_FS = [
 'uniform float uCamAsp;',
 '',
 'void main(){',
-'  float rStr=mix(0.10,0.14,uMode);',
-'  float lStr=mix(1.5,2.8,uMode);',
-'  float disp=mix(0.022,0.05,uMode);',
+// Strong ripple parameters (user-specified) + frosted glass
+'  float rStr=mix(0.07,0.10,uMode);',
+'  float lStr=mix(1.4,2.8,uMode);',
+'  float disp=mix(0.025,0.055,uMode);',
 '  float fBase=mix(0.04,0.07,uMode);',
-'  float dStr=mix(0.4,0.8,uMode);',
-'  float blurR=mix(3.5,5.0,uMode);',
-'  float milkStr=mix(0.14,0.20,uMode);',
+'  float dStr=mix(0.5,1.0,uMode);',
+'  float blurR=mix(2.5,4.0,uMode);',
+'  float milkStr=mix(0.10,0.15,uMode);',
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -212,15 +213,15 @@ var RENDER_FS = [
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
 '  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
 '',
-// Frosted glass: 5-tap blur driven by activity
+// 5-tap blur for frosted glass (milder than before)
 '  vec2 bOff=blurR*t*activity;',
 '  vec3 sC=texture2D(uCam,cUv+oG).rgb;',
 '  vec3 sL=texture2D(uCam,cUv+oG+vec2(-bOff.x,0)).rgb;',
 '  vec3 sR=texture2D(uCam,cUv+oG+vec2( bOff.x,0)).rgb;',
 '  vec3 sT=texture2D(uCam,cUv+oG+vec2(0, bOff.y)).rgb;',
-'  vec3 sB2=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
-'  vec3 col=(sC*2.0+sL+sR+sT+sB2)/6.0;',
-// Chromatic on top
+'  vec3 sBot=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
+'  vec3 col=(sC*2.0+sL+sR+sT+sBot)/6.0;',
+// Chromatic dispersion
 '  col.r=texture2D(uCam,cUv+oR+vec2(-bOff.x*0.3,0)).r*0.5+col.r*0.5;',
 '  col.b=texture2D(uCam,cUv+oB+vec2( bOff.x*0.3,0)).b*0.5+col.b*0.5;',
 '',
@@ -229,25 +230,26 @@ var RENDER_FS = [
 '  float NdV=max(dot(N,V),0.0);',
 '  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
 '',
-// Depth shading — subtle, clamped
+// Depth shading — moderate contrast
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
-'  vec3 warm=vec3(1.02,0.99,0.95);',
-'  vec3 cool=vec3(0.93,0.96,1.03);',
+'  vec3 warm=vec3(1.04,0.99,0.94);',
+'  vec3 cool=vec3(0.90,0.95,1.04);',
 '  col*=mix(cool,warm,df);',
 '',
-// Milky frosted overlay
-'  vec3 milk=mix(vec3(0.85,0.88,0.95),vec3(0.80,0.84,0.92),uMode);',
+// Milky frosted overlay — subtle, prevents white blow
+'  vec3 milk=mix(vec3(0.82,0.86,0.93),vec3(0.78,0.82,0.90),uMode);',
 '  col=mix(col,milk,activity*milkStr);',
 '',
-// Soft broad specular only
+// Soft dual-lobe specular — no white blow
 '  vec3 L=normalize(vec3(0.3,0.5,1.0));',
-'  vec3 H=normalize(L+V);',
-'  float sB=pow(max(dot(N,H),0.0),mix(12.0,20.0,uMode));',
-'  col+=vec3(0.55,0.60,0.70)*sB*0.12*fres;',
+'  vec3 Hv=normalize(L+V);',
+'  float sSh=pow(max(dot(N,Hv),0.0),mix(160.0,350.0,uMode));',
+'  float sBr=pow(max(dot(N,Hv),0.0),mix(14.0,26.0,uMode));',
+'  col+=vec3(0.45,0.50,0.60)*(sSh*1.2+sBr*0.18)*fres;',
 '',
-// Fresnel — cool tinted, not white
-'  vec3 rCol=mix(vec3(0.65,0.75,0.90),vec3(0.60,0.72,0.88),uMode);',
-'  col=mix(col,rCol,fres*0.35);',
+// Fresnel — cool tinted
+'  vec3 rCol=mix(vec3(0.62,0.74,0.90),vec3(0.58,0.70,0.88),uMode);',
+'  col=mix(col,rCol,fres*0.45);',
 '',
 '  gl_FragColor=vec4(col,1.0);',
 '}'
