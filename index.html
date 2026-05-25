@@ -170,8 +170,8 @@ var SIM_FS = [
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
-'uniform sampler2D uH;',      // height field
-'uniform sampler2D uCam;',    // camera texture
+'uniform sampler2D uH;',
+'uniform sampler2D uCam;',
 'uniform vec2 uTexel;',
 'uniform float uAspect;',
 'uniform float uMirror;',
@@ -179,14 +179,13 @@ var RENDER_FS = [
 'uniform float uCamAsp;',
 '',
 'void main(){',
-// Mode-dependent parameters (branch-free)
 '  float rStr=mix(0.10,0.14,uMode);',
 '  float lStr=mix(1.5,2.8,uMode);',
 '  float disp=mix(0.022,0.05,uMode);',
 '  float fBase=mix(0.04,0.07,uMode);',
 '  float dStr=mix(0.4,0.8,uMode);',
-'  float blurR=mix(3.5,5.0,uMode);',   // frosted blur radius (in texels)
-'  float milkStr=mix(0.14,0.20,uMode);',// milky overlay strength
+'  float blurR=mix(3.5,5.0,uMode);',
+'  float milkStr=mix(0.14,0.20,uMode);',
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -197,21 +196,15 @@ var RENDER_FS = [
 '  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',
 '  float lap=hL+hR+hT+hB-4.0*h;',
 '  float gMag=length(grad);',
-'',
-// Activity: how much disturbance at this pixel
 '  float activity=smoothstep(0.0,0.12,gMag);',
 '',
-// Refraction + lens
 '  vec2 rOff=grad*rStr;',
 '  vec2 lOff=-grad*lap*lStr;',
 '  vec2 tot=rOff+lOff;',
-'',
-// Chromatic dispersion
 '  vec2 oR=tot*(1.0+disp);',
 '  vec2 oG=tot;',
 '  vec2 oB=tot*(1.0-disp);',
 '',
-// Camera UV with cover-fit + mirror
 '  vec2 cUv=vUv;',
 '  float nCX=step(uAspect,uCamAsp);',
 '  float crX=nCX*(1.0-uAspect/uCamAsp)*0.5;',
@@ -219,45 +212,40 @@ var RENDER_FS = [
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
 '  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
 '',
-// ── Frosted glass blur: sample 5 points, weighted average ──
-// Sharper when activity is low, blurrier when high
+// Frosted glass: 5-tap blur driven by activity
 '  vec2 bOff=blurR*t*activity;',
 '  vec3 sC=texture2D(uCam,cUv+oG).rgb;',
 '  vec3 sL=texture2D(uCam,cUv+oG+vec2(-bOff.x,0)).rgb;',
 '  vec3 sR=texture2D(uCam,cUv+oG+vec2( bOff.x,0)).rgb;',
 '  vec3 sT=texture2D(uCam,cUv+oG+vec2(0, bOff.y)).rgb;',
-'  vec3 sB=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
-'  vec3 col=(sC*2.0+sL+sR+sT+sB)/6.0;',
-'',
-// Chromatic dispersion on top of blur
+'  vec3 sB2=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
+'  vec3 col=(sC*2.0+sL+sR+sT+sB2)/6.0;',
+// Chromatic on top
 '  col.r=texture2D(uCam,cUv+oR+vec2(-bOff.x*0.3,0)).r*0.5+col.r*0.5;',
 '  col.b=texture2D(uCam,cUv+oB+vec2( bOff.x*0.3,0)).b*0.5+col.b*0.5;',
 '',
-// Normal (aspect-corrected)
 '  vec3 N=normalize(vec3(-grad.x*uAspect,-grad.y,1.0));',
 '  vec3 V=vec3(0.0,0.0,1.0);',
-'',
-// Fresnel (Schlick)
 '  float NdV=max(dot(N,V),0.0);',
 '  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
 '',
-// Wave depth shading: very subtle warm/cool, clamp to avoid >1.0
+// Depth shading — subtle, clamped
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
 '  vec3 warm=vec3(1.02,0.99,0.95);',
 '  vec3 cool=vec3(0.93,0.96,1.03);',
 '  col*=mix(cool,warm,df);',
 '',
-// ── Milky / frosted overlay ── translucent white-cold veil in disturbed areas
+// Milky frosted overlay
 '  vec3 milk=mix(vec3(0.85,0.88,0.95),vec3(0.80,0.84,0.92),uMode);',
 '  col=mix(col,milk,activity*milkStr);',
 '',
-// Very soft broad specular (frosted glass has no sharp highlights)
+// Soft broad specular only
 '  vec3 L=normalize(vec3(0.3,0.5,1.0));',
 '  vec3 H=normalize(L+V);',
 '  float sB=pow(max(dot(N,H),0.0),mix(12.0,20.0,uMode));',
-'  col+=vec3(0.6,0.65,0.75)*sB*0.12*fres;',
+'  col+=vec3(0.55,0.60,0.70)*sB*0.12*fres;',
 '',
-// Fresnel reflection — cool tinted, not white
+// Fresnel — cool tinted, not white
 '  vec3 rCol=mix(vec3(0.65,0.75,0.90),vec3(0.60,0.72,0.88),uMode);',
 '  col=mix(col,rCol,fres*0.35);',
 '',
@@ -340,7 +328,8 @@ function createFBO(w,h){
   var st=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
   if(st!==gl.FRAMEBUFFER_COMPLETE){
-    showError('FBO 不完整 (status=0x'+st.toString(16)+')');return null;
+    gl.deleteTexture(t);gl.deleteFramebuffer(f);
+    return null;
   }
   return {tex:t,fbo:f};
 }
@@ -349,11 +338,27 @@ function initFBOs(){
   var dpr = Math.min(window.devicePixelRatio||1, 2);
   canvas.width  = Math.round(canvas.clientWidth  * dpr);
   canvas.height = Math.round(canvas.clientHeight * dpr);
-  var maxDim=512;
+  // Try decreasing maxDim until FBO is supported (mobile GPU fallback)
+  var maxDimTry=[512,384,256,128];
   var aspect=canvas.width/canvas.height;
-  if(aspect>=1){simW=maxDim;simH=Math.round(maxDim/aspect)}
-  else{simH=maxDim;simW=Math.round(maxDim*aspect)}
-  simW=Math.max(simW,1);simH=Math.max(simH,1);
+  var ok=false;
+  for(var m=0;m<maxDimTry.length;m++){
+    var md=maxDimTry[m];
+    var tw,th;
+    if(aspect>=1){tw=md;th=Math.round(md/aspect)}
+    else{th=md;tw=Math.round(md*aspect)}
+    tw=Math.max(tw,1);th=Math.max(th,1);
+    // Test with one FBO first
+    var test=createFBO(tw,th);
+    if(test){
+      gl.deleteTexture(test.tex);
+      gl.deleteFramebuffer(test.fbo);
+      simW=tw;simH=th;
+      ok=true;
+      break;
+    }
+  }
+  if(!ok){showError('设备不支持浮点帧缓冲');return}
   // destroy old
   fbo.forEach(function(f){gl.deleteFramebuffer(f)});
   tex.forEach(function(t){gl.deleteTexture(t)});
