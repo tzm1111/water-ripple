@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>AquaLens</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;touch-action:none}
+canvas{display:block;width:100%;height:100%}
+video{display:none}
+#ui{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10}
+#status{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:15px;text-align:center;text-shadow:0 1px 6px rgba(0,0,0,.9);transition:opacity .6s;line-height:1.6}
+#status.hidden{opacity:0;pointer-events:none}
+#errBox{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#f66;font-family:Menlo,Consolas,monospace;font-size:11px;max-width:92%;max-height:60vh;overflow:auto;background:rgba(0,0,0,.9);padding:14px;border-radius:10px;white-space:pre-wrap;display:none;pointer-events:auto;z-index:100}
+#modeBar{position:absolute;bottom:28px;left:50%;transform:translateX(-50%);display:flex;gap:6px;pointer-events:auto}
+.mbtn{padding:10px 26px;border:1.5px solid rgba(255,255,255,.3);border-radius:22px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.55);font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:12px;font-weight:700;letter-spacing:2.5px;cursor:pointer;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);transition:all .3s;-webkit-tap-highlight-color:transparent}
+.mbtn.on{background:rgba(255,255,255,.25);color:#fff;border-color:rgba(255,255,255,.65)}
+#camBtn{position:absolute;top:16px;right:16px;width:42px;height:42px;border-radius:50%;border:1.5px solid rgba(255,255,255,.25);background:rgba(255,255,255,.08);color:#fff;font-size:18px;cursor:pointer;pointer-events:auto;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);display:flex;align-items:center;justify-content:center;transition:all .3s;-webkit-tap-highlight-color:transparent}
+#camBtn:active{transform:scale(.88)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" autoplay playsinline muted></video>
+<div id="ui">
+  <div id="status">初始化中…</div>
+  <div id="errBox"></div>
+  <div id="modeBar">
+    <button class="mbtn on" data-m="0">LIQUID</button>
+    <button class="mbtn" data-m="1">CRYSTAL</button>
+  </div>
+  <button id="camBtn">&#x21bb;</button>
+</div>
+
+<script>
+// Async load MediaPipe Hands — don't block the page
+var mpScript = document.createElement('script');
+mpScript.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js';
+mpScript.crossOrigin = 'anonymous';
+mpScript.async = true;
+document.head.appendChild(mpScript);
+</script>
+<script>
+(function(){
+"use strict";
+
+/* ── DOM ─────────────────────────────── */
+var canvas  = document.getElementById('c');
+var video   = document.getElementById('v');
+var statusEl= document.getElementById('status');
+var errBox  = document.getElementById('errBox');
+var modeBtns= document.querySelectorAll('.mbtn');
+var camBtn  = document.getElementById('camBtn');
+
+/* ── State ───────────────────────────── */
+var mode = 0;            // 0=LIQUID 1=CRYSTAL
+var facingMode = 'user'; // 'user' front | 'environment' back
+var isMirrored = true;
+var cameraReady = false;
+var mpHands = null;
+
+var MAX_F = 10;
+var fingerCount = 0;
+var fingerPos  = new Float32Array(MAX_F * 2);
+var fingerPrev = new Float32Array(MAX_F * 2);
+// touch / mouse
+var inputCount = 0;
+var inputPos  = new Float32Array(MAX_F * 2);
+var inputPrev = new Float32Array(MAX_F * 2);
+var mouseDown = false;
+var mouseX = 0, mouseY = 0, mousePrevX = 0, mousePrevY = 0;
+
+/* ── Error helper ────────────────────── */
+function showError(msg){
+  errBox.style.display='block'; errBox.textContent=msg;
+}
+
+/* ── WebGL ───────────────────────────── */
+var gl = canvas.getContext('webgl',{alpha:false,antialias:false,premultipliedAlpha:false,preserveDrawingBuffer:false});
+if(!gl){showError('WebGL 不可用');return}
+
+var floatExt    = gl.getExtension('OES_texture_float');
+var floatLinExt = gl.getExtension('OES_texture_float_linear');
+var hfExt       = gl.getExtension('OES_texture_half_float');
+var hfLinExt    = gl.getExtension('OES_texture_half_float_linear');
+
+var texType, texFilter;
+if(floatExt){texType=gl.FLOAT;texFilter=floatLinExt?gl.LINEAR:gl.NEAREST}
+else if(hfExt){texType=hfExt.HALF_FLOAT_OES;texFilter=hfLinExt?gl.LINEAR:gl.NEAREST}
+else{showError('设备不支持浮点纹理');return}
+
+/* ── Shader sources ──────────────────── */
+var VS = [
+'attribute vec2 aPos;',
+'varying vec2 vUv;',
+'void main(){',
+'  vUv = aPos*0.5+0.5;',
+'  gl_Position = vec4(aPos,0.0,1.0);',
+'}'
+].join('\n');
+
+// Simulation: wave equation with 9-tap Laplacian + capsule SDF drops
+var SIM_FS = [
+'precision highp float;',
+'varying vec2 vUv;',
+'uniform sampler2D uState;',   // RG = height, velocity
+'uniform vec2 uTexel;',
+'uniform float uSpeed;',
+'uniform float uDampLo;',     // small amp → fast decay
+'uniform float uDampHi;',     // large amp → slow decay
+'uniform float uDampTh;',
+'uniform float uAspect;',
+'uniform float uFCnt;',
+'uniform vec2 uFP[10];',
+'uniform vec2 uFPr[10];',
+'uniform float uDR;',         // drop radius
+'uniform float uDS;',         // drop strength',
+'',
+'float capSDF(vec2 p,vec2 a,vec2 b){',
+'  vec2 pa=p-a, ba=b-a;',
+'  float h=clamp(dot(pa,ba)/(dot(ba,ba)+1e-6),0.0,1.0);',
+'  return length(pa-ba*h);',
+'}',
+'',
+'void main(){',
+'  vec4 s=texture2D(uState,vUv);',
+'  float h=s.r, v=s.g;',
+'  vec2 t=uTexel;',
+'  float hL=texture2D(uState,vUv+vec2(-t.x,0)).r;',
+'  float hR=texture2D(uState,vUv+vec2( t.x,0)).r;',
+'  float hT=texture2D(uState,vUv+vec2(0, t.y)).r;',
+'  float hB=texture2D(uState,vUv+vec2(0,-t.y)).r;',
+'  float hTL=texture2D(uState,vUv+vec2(-t.x, t.y)).r;',
+'  float hTR=texture2D(uState,vUv+vec2( t.x, t.y)).r;',
+'  float hBL=texture2D(uState,vUv+vec2(-t.x,-t.y)).r;',
+'  float hBR=texture2D(uState,vUv+vec2( t.x,-t.y)).r;',
+// 9-tap isotropic Laplacian
+'  float lap=(hTL+hTR+hBL+hBR)/6.0+(hL+hR+hT+hB)*2.0/3.0-h*10.0/3.0;',
+'',
+// Finger drops with aspect-corrected capsule SDF
+'  float drop=0.0;',
+'  for(int i=0;i<10;i++){',
+'    float fi=float(i);',
+'    float a=step(fi+0.5,uFCnt);',
+'    vec2 pA=vec2(vUv.x*uAspect,vUv.y);',
+'    vec2 aA=vec2(uFPr[i].x*uAspect,uFPr[i].y);',
+'    vec2 bA=vec2(uFP[i].x*uAspect,uFP[i].y);',
+'    float d=capSDF(pA,aA,bA);',
+'    float r=uDR*uAspect;',
+'    drop+=uDS*smoothstep(r,0.0,d)*a;',
+'  }',
+'',
+// Non-linear damping
+'  float amp=abs(h);',
+'  float damp=mix(uDampLo,uDampHi,smoothstep(0.0,uDampTh,amp));',
+'  v = v*damp + uSpeed*lap + drop;',
+'  h += v;',
+// Soft clamp to prevent runaway
+'  h *= 1.0 - smoothstep(1.5,2.5,abs(h))*0.15;',
+'',
+'  gl_FragColor=vec4(h,v,0.0,1.0);',
+'}'
+].join('\n');
+
+// Render: refraction + lens + dispersion + Fresnel + depth + specular
+var RENDER_FS = [
+'precision highp float;',
+'varying vec2 vUv;',
+'uniform sampler2D uH;',      // height field
+'uniform sampler2D uCam;',    // camera texture
+'uniform vec2 uTexel;',
+'uniform float uAspect;',
+'uniform float uMirror;',
+'uniform float uMode;',
+'uniform float uCamAsp;',
+'',
+'void main(){',
+// Mode-dependent parameters (branch-free)
+'  float rStr=mix(0.04,0.07,uMode);',
+'  float lStr=mix(0.8,1.6,uMode);',
+'  float disp=mix(0.018,0.045,uMode);',
+'  float fBase=mix(0.02,0.05,uMode);',
+'  float dStr=mix(0.35,0.7,uMode);',
+'  float spS=mix(220.0,450.0,uMode);',
+'  float spB=mix(14.0,28.0,uMode);',
+'',
+'  float h=texture2D(uH,vUv).r;',
+'  vec2 t=uTexel;',
+'  float hL=texture2D(uH,vUv+vec2(-t.x,0)).r;',
+'  float hR=texture2D(uH,vUv+vec2( t.x,0)).r;',
+'  float hT=texture2D(uH,vUv+vec2(0, t.y)).r;',
+'  float hB=texture2D(uH,vUv+vec2(0,-t.y)).r;',
+'  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',       // NOT normalized
+'  float lap=hL+hR+hT+hB-4.0*h;',
+'',
+// Refraction + lens
+'  vec2 rOff=grad*rStr;',
+'  vec2 lOff=-grad*lap*lStr;',
+'  vec2 tot=rOff+lOff;',
+'',
+// Chromatic dispersion
+'  vec2 oR=tot*(1.0+disp);',
+'  vec2 oG=tot;',
+'  vec2 oB=tot*(1.0-disp);',
+'',
+// Camera UV with cover-fit + mirror
+'  vec2 cUv=vUv;',
+'  float nCX=step(uAspect,uCamAsp);',         // need crop X?
+'  float crX=nCX*(1.0-uAspect/uCamAsp)*0.5;',
+'  float crY=(1.0-nCX)*(1.0-uCamAsp/uAspect)*0.5;',
+'  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
+'  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
+'',
+'  float cr=texture2D(uCam,cUv+oR).r;',
+'  float cg=texture2D(uCam,cUv+oG).g;',
+'  float cb=texture2D(uCam,cUv+oB).b;',
+'  vec3 col=vec3(cr,cg,cb);',
+'',
+// Normal (aspect-corrected)
+'  vec3 N=normalize(vec3(-grad.x*uAspect,-grad.y,1.0));',
+'  vec3 V=vec3(0.0,0.0,1.0);',
+'',
+// Fresnel (Schlick)
+'  float NdV=max(dot(N,V),0.0);',
+'  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
+'',
+// Wave depth shading: warm peaks, cool troughs
+'  float df=smoothstep(-1.0,1.0,h*dStr);',
+'  vec3 warm=vec3(1.06,0.97,0.87);',
+'  vec3 cool=vec3(0.87,0.95,1.08);',
+'  col*=mix(cool,warm,df);',
+'',
+// Dual-lobe specular
+'  vec3 L=normalize(vec3(0.3,0.5,1.0));',
+'  vec3 H=normalize(L+V);',
+'  float sS=pow(max(dot(N,H),0.0),spS);',
+'  float sB=pow(max(dot(N,H),0.0),spB);',
+'  col+=vec3(1.0,0.97,0.92)*(sS*0.9+sB*0.13)*fres;',
+'',
+// Fresnel reflection overlay
+'  vec3 rCol=mix(vec3(0.72,0.84,1.0),vec3(0.65,0.80,1.0),uMode);',
+'  col=mix(col,rCol,fres*0.38);',
+'',
+'  gl_FragColor=vec4(col,1.0);',
+'}'
+].join('\n');
+
+/* ── Shader helpers ──────────────────── */
+function compileShader(src,type){
+  var s=gl.createShader(type);
+  gl.shaderSource(s,src);gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){
+    var log=gl.getShaderInfoLog(s);
+    showError('Shader 编译错误:\n'+log);
+    gl.deleteShader(s);return null;
+  }
+  return s;
+}
+function linkProgram(vs,fs){
+  var p=gl.createProgram();
+  gl.attachShader(p,vs);gl.attachShader(p,fs);
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)){
+    var log=gl.getProgramInfoLog(p);
+    showError('Program 链接错误:\n'+log);return null;
+  }
+  return p;
+}
+function makeProgram(fsSrc){
+  var vs=compileShader(VS,gl.VERTEX_SHADER);
+  var fs=compileShader(fsSrc,gl.FRAGMENT_SHADER);
+  if(!vs||!fs)return null;
+  var p=linkProgram(vs,fs);
+  gl.deleteShader(vs);gl.deleteShader(fs);
+  return p;
+}
+function getUniforms(progr,names){
+  var o={};names.forEach(function(n){o[n]=gl.getUniformLocation(progr,n)});return o;
+}
+
+/* ── Create programs ─────────────────── */
+var simProg = makeProgram(SIM_FS);
+var renProg = makeProgram(RENDER_FS);
+if(!simProg||!renProg) return;
+
+var sU = getUniforms(simProg,[
+  'uState','uTexel','uSpeed','uDampLo','uDampHi','uDampTh','uAspect',
+  'uFCnt','uFP[0]','uFPr[0]','uDR','uDS'
+]);
+var rU = getUniforms(renProg,[
+  'uH','uCam','uTexel','uAspect','uMirror','uMode','uCamAsp'
+]);
+
+/* ── Fullscreen quad ─────────────────── */
+var quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+function bindQuad(prog){
+  var loc=gl.getAttribLocation(prog,'aPos');
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+}
+
+/* ── FBO ping-pong ───────────────────── */
+var simW, simH, fbo=[], tex=[], fbi=0;
+
+function createFBO(w,h){
+  var t=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,texType,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,texFilter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,texFilter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  var f=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  var st=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  if(st!==gl.FRAMEBUFFER_COMPLETE){
+    showError('FBO 不完整 (status=0x'+st.toString(16)+')');return null;
+  }
+  return {tex:t,fbo:f};
+}
+
+function initFBOs(){
+  var dpr = Math.min(window.devicePixelRatio||1, 2);
+  canvas.width  = Math.round(canvas.clientWidth  * dpr);
+  canvas.height = Math.round(canvas.clientHeight * dpr);
+  var maxDim=256;
+  var aspect=canvas.width/canvas.height;
+  if(aspect>=1){simW=maxDim;simH=Math.round(maxDim/aspect)}
+  else{simH=maxDim;simW=Math.round(maxDim*aspect)}
+  simW=Math.max(simW,1);simH=Math.max(simH,1);
+  // destroy old
+  fbo.forEach(function(f){gl.deleteFramebuffer(f)});
+  tex.forEach(function(t){gl.deleteTexture(t)});
+  fbo=[];tex=[];
+  for(var i=0;i<2;i++){
+    var r=createFBO(simW,simH);
+    if(!r)return;
+    tex.push(r.tex);fbo.push(r.fbo);
+    // clear
+    gl.bindFramebuffer(gl.FRAMEBUFFER,r.fbo);
+    gl.viewport(0,0,simW,simH);
+    gl.clearColor(0,0,0,1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+}
+initFBOs();
+
+/* ── Camera texture ──────────────────── */
+var camTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D,camTex);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+// placeholder 1x1
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
+
+var camAspect = 1;
+
+/* ── Camera setup ────────────────────── */
+var mediaStream = null;
+
+function startCamera(){
+  if(mediaStream){mediaStream.getTracks().forEach(function(t){t.stop()})}
+  isMirrored = (facingMode==='user');
+  // Check secure context
+  if(location.protocol!=='https:'&&location.hostname!=='localhost'&&location.hostname!=='127.0.0.1'){
+    statusEl.textContent='需要 HTTPS 才能访问摄像头\n请用本地服务器打开此文件';
+    return;
+  }
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    statusEl.textContent='浏览器不支持摄像头\n请用触摸/鼠标交互';
+    setTimeout(function(){statusEl.classList.add('hidden')},3000);
+    return;
+  }
+  statusEl.textContent='正在请求摄像头…';
+  var constraints = {
+    video:{facingMode:facingMode, width:{ideal:1280}, height:{ideal:720}},
+    audio:false
+  };
+  navigator.mediaDevices.getUserMedia(constraints).then(function(stream){
+    mediaStream=stream;
+    video.srcObject=stream;
+    video.onloadedmetadata=function(){
+      camAspect = video.videoWidth/video.videoHeight;
+      cameraReady=true;
+      statusEl.textContent='加载手部检测模型…';
+      statusEl.classList.add('hidden');
+    };
+  }).catch(function(e){
+    console.warn('摄像头错误:',e);
+    statusEl.textContent='摄像头不可用: '+e.name+'\n请用触摸/鼠标交互';
+    setTimeout(function(){statusEl.classList.add('hidden')},4000);
+    // Allow touch interaction even without camera
+    cameraReady=true;
+  });
+}
+startCamera();
+
+function switchCamera(){
+  facingMode = (facingMode==='user')?'environment':'user';
+  cameraReady=false;
+  statusEl.textContent='切换摄像头…';
+  statusEl.classList.remove('hidden');
+  startCamera();
+}
+
+camBtn.addEventListener('click', switchCamera);
+
+/* ── MediaPipe Hands ─────────────────── */
+var TIP_IDS = [4,8,12,16,20]; // 5 tips per hand
+
+function initHands(){
+  if(typeof Hands==='undefined'){
+    // Hands not loaded yet, retry
+    if(!window._handsRetry) window._handsRetry=0;
+    window._handsRetry++;
+    if(window._handsRetry<30){ // retry for ~3s
+      setTimeout(initHands,100);
+    } else {
+      console.warn('MediaPipe Hands 加载超时，仅支持触摸交互');
+      statusEl.textContent='手部检测不可用\n请用触摸/鼠标交互';
+      setTimeout(function(){statusEl.classList.add('hidden')},3000);
+    }
+    return;
+  }
+  try{
+    mpHands = new Hands({
+      locateFile:function(f){return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/'+f}
+    });
+    mpHands.setOptions({
+      maxNumHands:2,
+      modelComplexity:1,
+      minDetectionConfidence:0.6,
+      minTrackingConfidence:0.5
+    });
+    mpHands.onResults(onHandResults);
+    console.log('MediaPipe Hands 初始化成功');
+  }catch(e){
+    console.warn('MediaPipe Hands 初始化失败',e);
+    mpHands=null;
+  }
+}
+
+// Cover-fit reverse: camera UV → screen UV
+function camToScreen(cx,cy){
+  var ca=camAspect, sa=canvas.width/canvas.height;
+  var nCX=ca>sa?1:0;
+  var crX=nCX*(1-sa/ca)*0.5;
+  var crY=(1-nCX)*(1-ca/sa)*0.5;
+  var sx=(cx-crX)/Math.max(1-2*crX,0.001);
+  var sy=(cy-crY)/Math.max(1-2*crY,0.001);
+  return{x:Math.max(0,Math.min(1,sx)),y:Math.max(0,Math.min(1,sy))};
+}
+
+function onHandResults(results){
+  var idx=0;
+  if(results.multiHandLandmarks){
+    for(var h=0;h<results.multiHandLandmarks.length && idx<MAX_F;h++){
+      var lm=results.multiHandLandmarks[h];
+      for(var t=0;t<TIP_IDS.length && idx<MAX_F;t++){
+        var pt=lm[TIP_IDS[t]];
+        // Save previous
+        fingerPrev[idx*2]   = fingerPos[idx*2];
+        fingerPrev[idx*2+1] = fingerPos[idx*2+1];
+        // Flip Y for WebGL, flip X for front camera
+        var fx = isMirrored ? (1.0-pt.x) : pt.x;
+        var fy = 1.0-pt.y;
+        // Cover-fit reverse: camera UV → screen UV
+        var sc=camToScreen(fx,fy);
+        fingerPos[idx*2]   = sc.x;
+        fingerPos[idx*2+1] = sc.y;
+        idx++;
+      }
+    }
+  }
+  fingerCount=idx;
+}
+
+var handsBusy=false;
+function sendHandsFrame(){
+  if(!mpHands||handsBusy||!cameraReady)return;
+  if(video.readyState<video.HAVE_CURRENT_DATA)return;
+  handsBusy=true;
+  mpHands.send({image:video}).then(function(){handsBusy=false}).catch(function(){handsBusy=false});
+}
+
+// Load MediaPipe after page loads
+setTimeout(initHands, 100);
+
+/* ── Touch / Mouse ───────────────────── */
+function getUV(clientX,clientY){
+  var r=canvas.getBoundingClientRect();
+  return {x:(clientX-r.left)/r.width, y:1.0-(clientY-r.top)/r.height};
+}
+
+canvas.addEventListener('touchstart',function(e){
+  e.preventDefault();
+  var n=Math.min(e.touches.length, MAX_F);
+  inputCount=n;
+  for(var i=0;i<n;i++){
+    var uv=getUV(e.touches[i].clientX, e.touches[i].clientY);
+    // On start, prev=pos → capsule degenerates to circle
+    inputPos[i*2]=inputPrev[i*2]=uv.x;
+    inputPos[i*2+1]=inputPrev[i*2+1]=uv.y;
+  }
+},{passive:false});
+canvas.addEventListener('touchmove',function(e){
+  e.preventDefault();
+  var n=Math.min(e.touches.length, MAX_F);
+  inputCount=n;
+  for(var i=0;i<n;i++){
+    var uv=getUV(e.touches[i].clientX, e.touches[i].clientY);
+    inputPrev[i*2]  =inputPos[i*2];
+    inputPrev[i*2+1]=inputPos[i*2+1];
+    inputPos[i*2]  =uv.x;
+    inputPos[i*2+1]=uv.y;
+  }
+},{passive:false});
+canvas.addEventListener('touchend',function(e){
+  e.preventDefault();
+  if(e.touches.length===0){inputCount=0;return}
+  var n=Math.min(e.touches.length, MAX_F);
+  inputCount=n;
+  for(var i=0;i<n;i++){
+    var uv=getUV(e.touches[i].clientX, e.touches[i].clientY);
+    inputPrev[i*2]  =inputPos[i*2];
+    inputPrev[i*2+1]=inputPos[i*2+1];
+    inputPos[i*2]  =uv.x;
+    inputPos[i*2+1]=uv.y;
+  }
+},{passive:false});
+canvas.addEventListener('touchcancel',function(e){
+  inputCount=0;
+});
+
+canvas.addEventListener('mousedown',function(e){
+  mouseDown=true;var uv=getUV(e.clientX,e.clientY);
+  mousePrevX=mouseX=uv.x;mousePrevY=mouseY=uv.y;
+});
+canvas.addEventListener('mousemove',function(e){
+  if(!mouseDown)return;
+  var uv=getUV(e.clientX,e.clientY);
+  mousePrevX=mouseX;mousePrevY=mouseY;
+  mouseX=uv.x;mouseY=uv.y;
+});
+canvas.addEventListener('mouseup',function(){mouseDown=false});
+
+/* ── Combine fingers + touch into uniform data ── */
+var combPos  = new Float32Array(MAX_F*2);
+var combPrev = new Float32Array(MAX_F*2);
+var combCount= 0;
+
+function combineInputs(){
+  // Hand fingers first
+  var hCount = fingerCount;
+  combCount = hCount;
+  combPos.set(fingerPos.subarray(0, hCount*2));
+  combPrev.set(fingerPrev.subarray(0, hCount*2));
+  // Then touch
+  var tSlot = MAX_F - hCount;
+  var tCount = Math.min(inputCount, tSlot);
+  for(var i=0;i<tCount;i++){
+    combPos[(hCount+i)*2]   = inputPos[i*2];
+    combPos[(hCount+i)*2+1] = inputPos[i*2+1];
+    combPrev[(hCount+i)*2]  = inputPrev[i*2];
+    combPrev[(hCount+i)*2+1]= inputPrev[i*2+1];
+  }
+  combCount += tCount;
+  // Mouse
+  if(mouseDown && combCount<MAX_F){
+    combPos[combCount*2]  =mouseX;
+    combPos[combCount*2+1]=mouseY;
+    combPrev[combCount*2]  =mousePrevX;
+    combPrev[combCount*2+1]=mousePrevY;
+    combCount++;
+  }
+}
+
+/* ── Mode buttons ────────────────────── */
+modeBtns.forEach(function(btn){
+  btn.addEventListener('click',function(){
+    mode = parseInt(btn.dataset.m);
+    modeBtns.forEach(function(b){b.classList.toggle('on',b===btn)});
+  });
+});
+
+/* ── Render loop ─────────────────────── */
+function frame(){
+  requestAnimationFrame(frame);
+
+  // Upload camera texture (if available)
+  if(cameraReady && video.srcObject && video.readyState>=video.HAVE_CURRENT_DATA){
+    gl.bindTexture(gl.TEXTURE_2D,camTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video);
+  }
+
+  // Send frame to MediaPipe (throttled)
+  sendHandsFrame();
+
+  // Combine hand + touch + mouse
+  combineInputs();
+
+  // ── Simulation step ──
+  var readIdx  = fbi;
+  var writeIdx = 1-fbi;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo[writeIdx]);
+  gl.viewport(0,0,simW,simH);
+  gl.useProgram(simProg);
+  bindQuad(simProg);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[readIdx]);
+  gl.uniform1i(sU.uState, 0);
+
+  gl.uniform2f(sU.uTexel, 1.0/simW, 1.0/simH);
+
+  // Mode-interpolated sim params
+  var spd  = mix(0.24, 0.28, mode);
+  var dLo  = mix(0.955, 0.975, mode);
+  var dHi  = mix(0.996, 0.998, mode);
+  var dTh  = mix(0.5, 0.3, mode);
+  var dr   = mix(0.03, 0.025, mode);
+  var ds   = mix(0.18, 0.14, mode);
+  gl.uniform1f(sU.uSpeed, spd);
+  gl.uniform1f(sU.uDampLo, dLo);
+  gl.uniform1f(sU.uDampHi, dHi);
+  gl.uniform1f(sU.uDampTh, dTh);
+  gl.uniform1f(sU.uAspect, canvas.width/canvas.height);
+  gl.uniform1f(sU.uFCnt, combCount);
+  gl.uniform2fv(sU['uFP[0]'],  combPos);
+  gl.uniform2fv(sU['uFPr[0]'], combPrev);
+  gl.uniform1f(sU.uDR, dr);
+  gl.uniform1f(sU.uDS, ds);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+
+  fbi = writeIdx; // swap
+
+  // ── Render ──
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.useProgram(renProg);
+  bindQuad(renProg);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[fbi]);
+  gl.uniform1i(rU.uH, 0);
+
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.uniform1i(rU.uCam, 1);
+
+  gl.uniform2f(rU.uTexel, 1.0/simW, 1.0/simH);
+  gl.uniform1f(rU.uAspect, canvas.width/canvas.height);
+  gl.uniform1f(rU.uMirror, isMirrored?1.0:0.0);
+  gl.uniform1f(rU.uMode, mode);
+  gl.uniform1f(rU.uCamAsp, camAspect>0?camAspect:1.0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+}
+
+function mix(a,b,t){return a+(b-a)*t}
+
+requestAnimationFrame(frame);
+
+/* ── Resize ──────────────────────────── */
+var resizeTimer;
+window.addEventListener('resize',function(){
+  clearTimeout(resizeTimer);
+  resizeTimer=setTimeout(function(){
+    initFBOs();
+  },200);
+});
+
+})();
+</script>
+</body>
+</html>
