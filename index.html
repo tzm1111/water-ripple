@@ -166,7 +166,7 @@ var SIM_FS = [
 '}'
 ].join('\n');
 
-// Render: frosted liquid — strong ripples + blur + milk veil (no white blow)
+// Render: neon pink liquid glass — refraction + blur + pink tint + ridge glow + fingertip light
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
@@ -177,16 +177,16 @@ var RENDER_FS = [
 'uniform float uMirror;',
 'uniform float uMode;',
 'uniform float uCamAsp;',
+'uniform float uFCnt;',
+'uniform vec2 uFP[10];',
 '',
 'void main(){',
-// Strong ripple parameters (user-specified) + frosted glass
 '  float rStr=mix(0.07,0.10,uMode);',
 '  float lStr=mix(1.4,2.8,uMode);',
 '  float disp=mix(0.025,0.055,uMode);',
 '  float fBase=mix(0.04,0.07,uMode);',
 '  float dStr=mix(0.5,1.0,uMode);',
 '  float blurR=mix(2.5,4.0,uMode);',
-'  float milkStr=mix(0.10,0.15,uMode);',
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -197,7 +197,7 @@ var RENDER_FS = [
 '  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',
 '  float lap=hL+hR+hT+hB-4.0*h;',
 '  float gMag=length(grad);',
-'  float activity=smoothstep(0.0,0.12,gMag);',
+'  float activity=smoothstep(0.0,0.10,gMag);',
 '',
 '  vec2 rOff=grad*rStr;',
 '  vec2 lOff=-grad*lap*lStr;',
@@ -213,7 +213,7 @@ var RENDER_FS = [
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
 '  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
 '',
-// 5-tap blur for frosted glass (milder than before)
+// 5-tap blur for liquid glass
 '  vec2 bOff=blurR*t*activity;',
 '  vec3 sC=texture2D(uCam,cUv+oG).rgb;',
 '  vec3 sL=texture2D(uCam,cUv+oG+vec2(-bOff.x,0)).rgb;',
@@ -221,7 +221,6 @@ var RENDER_FS = [
 '  vec3 sT=texture2D(uCam,cUv+oG+vec2(0, bOff.y)).rgb;',
 '  vec3 sBot=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
 '  vec3 col=(sC*2.0+sL+sR+sT+sBot)/6.0;',
-// Chromatic dispersion
 '  col.r=texture2D(uCam,cUv+oR+vec2(-bOff.x*0.3,0)).r*0.5+col.r*0.5;',
 '  col.b=texture2D(uCam,cUv+oB+vec2( bOff.x*0.3,0)).b*0.5+col.b*0.5;',
 '',
@@ -230,25 +229,44 @@ var RENDER_FS = [
 '  float NdV=max(dot(N,V),0.0);',
 '  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
 '',
-// Depth shading — moderate contrast
+// Depth shading — pink warm / magenta cool
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
-'  vec3 warm=vec3(1.04,0.99,0.94);',
-'  vec3 cool=vec3(0.90,0.95,1.04);',
+'  vec3 warm=vec3(1.05,0.96,0.94);',
+'  vec3 cool=vec3(0.92,0.88,1.05);',
 '  col*=mix(cool,warm,df);',
 '',
-// Milky frosted overlay — subtle, prevents white blow
-'  vec3 milk=mix(vec3(0.82,0.86,0.93),vec3(0.78,0.82,0.90),uMode);',
-'  col=mix(col,milk,activity*milkStr);',
+// ── Pink neon overlay ── translucent pink-magenta veil in disturbed areas
+'  vec3 pinkVeil=mix(vec3(0.95,0.55,0.70),vec3(0.90,0.45,0.75),uMode);',
+'  col=mix(col,pinkVeil,activity*0.25);',
 '',
-// Soft dual-lobe specular — no white blow
+// ── Neon ridge/crest lines ── bright pink-white glow at wave peaks
+'  float ridge=smoothstep(0.02,0.0,abs(h)-gMag*0.35);',
+'  ridge*=smoothstep(0.0,0.08,gMag);',
+'  col+=vec3(1.0,0.75,0.85)*ridge*0.5;',
+'',
+// ── Fingertip glow ── bright circular light at each finger
+'  float fGlow=0.0;',
+'  for(int i=0;i<10;i++){',
+'    float fi=float(i);',
+'    float a=step(fi+0.5,uFCnt);',
+'    vec2 fp=uFP[i];',
+'    float dist=length((vUv-fp)*vec2(uAspect,1.0));',
+'    fGlow+=smoothstep(0.06,0.0,dist)*a;',
+'  }',
+'  fGlow=min(fGlow,1.0);',
+'  col+=vec3(1.0,0.70,0.82)*fGlow*0.6;',
+// Add a white core to fingertip glow
+'  col+=vec3(1.0,0.92,0.95)*smoothstep(0.55,1.0,fGlow)*0.4;',
+'',
+// Soft specular — pink-tinted
 '  vec3 L=normalize(vec3(0.3,0.5,1.0));',
 '  vec3 Hv=normalize(L+V);',
-'  float sSh=pow(max(dot(N,Hv),0.0),mix(160.0,350.0,uMode));',
-'  float sBr=pow(max(dot(N,Hv),0.0),mix(14.0,26.0,uMode));',
-'  col+=vec3(0.45,0.50,0.60)*(sSh*1.2+sBr*0.18)*fres;',
+'  float sSh=pow(max(dot(N,Hv),0.0),mix(120.0,280.0,uMode));',
+'  float sBr=pow(max(dot(N,Hv),0.0),mix(14.0,24.0,uMode));',
+'  col+=vec3(0.65,0.48,0.58)*(sSh*1.2+sBr*0.18)*fres;',
 '',
-// Fresnel — cool tinted
-'  vec3 rCol=mix(vec3(0.62,0.74,0.90),vec3(0.58,0.70,0.88),uMode);',
+// Fresnel — pink tinted reflection
+'  vec3 rCol=mix(vec3(0.85,0.55,0.72),vec3(0.82,0.48,0.75),uMode);',
 '  col=mix(col,rCol,fres*0.45);',
 '',
 '  gl_FragColor=vec4(col,1.0);',
@@ -298,7 +316,8 @@ var sU = getUniforms(simProg,[
   'uFCnt','uFP[0]','uFPr[0]','uDR','uDS'
 ]);
 var rU = getUniforms(renProg,[
-  'uH','uCam','uTexel','uAspect','uMirror','uMode','uCamAsp'
+  'uH','uCam','uTexel','uAspect','uMirror','uMode','uCamAsp',
+  'uFCnt','uFP[0]'
 ]);
 
 /* ── Fullscreen quad ─────────────────── */
@@ -701,6 +720,8 @@ function frame(){
   gl.uniform1f(rU.uMirror, isMirrored?1.0:0.0);
   gl.uniform1f(rU.uMode, mode);
   gl.uniform1f(rU.uCamAsp, camAspect>0?camAspect:1.0);
+  gl.uniform1f(rU.uFCnt, combCount);
+  gl.uniform2fv(rU['uFP[0]'], combPos);
 
   gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
 }
