@@ -166,7 +166,7 @@ var SIM_FS = [
 '}'
 ].join('\n');
 
-// Render: refraction + lens + dispersion + Fresnel + depth + caustics + ridge + specular
+// Render: frosted glass — refraction + blur + dispersion + Fresnel + subsurface
 var RENDER_FS = [
 'precision highp float;',
 'varying vec2 vUv;',
@@ -180,13 +180,13 @@ var RENDER_FS = [
 '',
 'void main(){',
 // Mode-dependent parameters (branch-free)
-'  float rStr=mix(0.12,0.16,uMode);',
-'  float lStr=mix(2.0,3.5,uMode);',
-'  float disp=mix(0.03,0.065,uMode);',
-'  float fBase=mix(0.03,0.06,uMode);',
-'  float dStr=mix(0.6,1.1,uMode);',
-'  float spS=mix(180.0,400.0,uMode);',
-'  float spB=mix(18.0,35.0,uMode);',
+'  float rStr=mix(0.10,0.14,uMode);',
+'  float lStr=mix(1.5,2.8,uMode);',
+'  float disp=mix(0.022,0.05,uMode);',
+'  float fBase=mix(0.04,0.07,uMode);',
+'  float dStr=mix(0.4,0.8,uMode);',
+'  float blurR=mix(3.5,5.0,uMode);',   // frosted blur radius (in texels)
+'  float milkStr=mix(0.14,0.20,uMode);',// milky overlay strength
 '',
 '  float h=texture2D(uH,vUv).r;',
 '  vec2 t=uTexel;',
@@ -196,9 +196,10 @@ var RENDER_FS = [
 '  float hB=texture2D(uH,vUv+vec2(0,-t.y)).r;',
 '  vec2 grad=vec2(hR-hL,hT-hB)*0.5;',
 '  float lap=hL+hR+hT+hB-4.0*h;',
-'',
-// Height gradient magnitude (for ridge detection)
 '  float gMag=length(grad);',
+'',
+// Activity: how much disturbance at this pixel
+'  float activity=smoothstep(0.0,0.12,gMag);',
 '',
 // Refraction + lens
 '  vec2 rOff=grad*rStr;',
@@ -218,10 +219,19 @@ var RENDER_FS = [
 '  cUv=vec2(cUv.x*(1.0-2.0*crX)+crX, cUv.y*(1.0-2.0*crY)+crY);',
 '  cUv.x=mix(cUv.x,1.0-cUv.x,uMirror);',
 '',
-'  float cr=texture2D(uCam,cUv+oR).r;',
-'  float cg=texture2D(uCam,cUv+oG).g;',
-'  float cb=texture2D(uCam,cUv+oB).b;',
-'  vec3 col=vec3(cr,cg,cb);',
+// ── Frosted glass blur: sample 5 points, weighted average ──
+// Sharper when activity is low, blurrier when high
+'  vec2 bOff=blurR*t*activity;',
+'  vec3 sC=texture2D(uCam,cUv+oG).rgb;',
+'  vec3 sL=texture2D(uCam,cUv+oG+vec2(-bOff.x,0)).rgb;',
+'  vec3 sR=texture2D(uCam,cUv+oG+vec2( bOff.x,0)).rgb;',
+'  vec3 sT=texture2D(uCam,cUv+oG+vec2(0, bOff.y)).rgb;',
+'  vec3 sB=texture2D(uCam,cUv+oG+vec2(0,-bOff.y)).rgb;',
+'  vec3 col=(sC*2.0+sL+sR+sT+sB)/6.0;',
+'',
+// Chromatic dispersion on top of blur
+'  col.r=texture2D(uCam,cUv+oR+vec2(-bOff.x*0.3,0)).r*0.5+col.r*0.5;',
+'  col.b=texture2D(uCam,cUv+oB+vec2( bOff.x*0.3,0)).b*0.5+col.b*0.5;',
 '',
 // Normal (aspect-corrected)
 '  vec3 N=normalize(vec3(-grad.x*uAspect,-grad.y,1.0));',
@@ -231,40 +241,25 @@ var RENDER_FS = [
 '  float NdV=max(dot(N,V),0.0);',
 '  float fres=fBase+(1.0-fBase)*pow(1.0-NdV,5.0);',
 '',
-// Wave depth shading: warm peaks, cool troughs
+// Wave depth shading: very subtle warm/cool, clamp to avoid >1.0
 '  float df=smoothstep(-1.0,1.0,h*dStr);',
-'  vec3 warm=vec3(1.08,0.98,0.88);',
-'  vec3 cool=vec3(0.85,0.94,1.10);',
+'  vec3 warm=vec3(1.02,0.99,0.95);',
+'  vec3 cool=vec3(0.93,0.96,1.03);',
 '  col*=mix(cool,warm,df);',
 '',
-// ── Ridge / crest lines ── bright lines at wave peaks
-'  float ridge=smoothstep(0.02,0.0,abs(h)-gMag*0.4);',
-'  ridge*=smoothstep(0.0,0.08,gMag);',
-'  col+=vec3(0.9,0.95,1.0)*ridge*0.7;',
+// ── Milky / frosted overlay ── translucent white-cold veil in disturbed areas
+'  vec3 milk=mix(vec3(0.85,0.88,0.95),vec3(0.80,0.84,0.92),uMode);',
+'  col=mix(col,milk,activity*milkStr);',
 '',
-// ── Caustics ── light focused by wave curvature
-'  float caust=pow(max(1.0-abs(lap)*0.35,0.0),6.0);',
-'  caust*=smoothstep(0.0,0.1,gMag);',
-'  col+=vec3(1.0,0.96,0.88)*caust*0.5;',
+// Very soft broad specular (frosted glass has no sharp highlights)
+'  vec3 L=normalize(vec3(0.3,0.5,1.0));',
+'  vec3 H=normalize(L+V);',
+'  float sB=pow(max(dot(N,H),0.0),mix(12.0,20.0,uMode));',
+'  col+=vec3(0.6,0.65,0.75)*sB*0.12*fres;',
 '',
-// Dual-lobe specular — two light sources for richer highlights
-'  vec3 L1=normalize(vec3(0.3,0.5,1.0));',
-'  vec3 L2=normalize(vec3(-0.4,0.3,1.0));',
-'  vec3 H1=normalize(L1+V);',
-'  vec3 H2=normalize(L2+V);',
-'  float sS1=pow(max(dot(N,H1),0.0),spS);',
-'  float sS2=pow(max(dot(N,H2),0.0),spS);',
-'  float sB1=pow(max(dot(N,H1),0.0),spB);',
-'  float sB2=pow(max(dot(N,H2),0.0),spB);',
-'  col+=vec3(1.0,0.97,0.92)*((sS1+sS2*0.6)*1.5+(sB1+sB2*0.4)*0.2)*fres;',
-'',
-// Fresnel reflection overlay — stronger for liquid glass look
-'  vec3 rCol=mix(vec3(0.72,0.84,1.0),vec3(0.65,0.80,1.0),uMode);',
-'  col=mix(col,rCol,fres*0.55);',
-'',
-// ── Overall activity glow ── disturbed areas slightly brighter
-'  float activity=smoothstep(0.0,0.15,gMag);',
-'  col+=vec3(0.08,0.10,0.14)*activity;',
+// Fresnel reflection — cool tinted, not white
+'  vec3 rCol=mix(vec3(0.65,0.75,0.90),vec3(0.60,0.72,0.88),uMode);',
+'  col=mix(col,rCol,fres*0.35);',
 '',
 '  gl_FragColor=vec4(col,1.0);',
 '}'
