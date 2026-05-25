@@ -42,6 +42,7 @@ mpScript.async = true;
 document.head.appendChild(mpScript);
 </script>
 <script>
+try{
 (function(){
 "use strict";
 
@@ -709,6 +710,10 @@ window.addEventListener('resize',function(){
 });
 
 })();
+}catch(e){
+  document.getElementById('errBox').style.display='block';
+  document.getElementById('errBox').textContent='FATAL: '+e.message+'\n'+e.stack;
+}
 </script>
 </body>
 </html>
